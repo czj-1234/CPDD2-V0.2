@@ -1,165 +1,275 @@
-from clearml import Task, Dataset
-from clearml.automation import HyperParameterOptimizer
-from clearml.automation import UniformIntegerParameterRange, UniformParameterRange
-import logging
-import time
-import json
-import os
+# "task_hpo.py"
 
-# Set up logging
+from clearml import Task
+from clearml.automation import (
+    HyperParameterOptimizer,
+    DiscreteParameterRange,
+    UniformParameterRange,
+    RandomSearch,
+)
+import logging
+
+
+# ============================================================
+# Logging
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize the HPO task
+
+# ============================================================
+# ClearML HPO Task
+# ============================================================
+
 task = Task.init(
-    project_name='AI_Studio_HPO_Demo',
-    task_name='HPO: Train Model',
+    project_name="AI_Studio_HPO_Demo",
+    task_name="HPO step 4 hyperparameter optimization",
     task_type=Task.TaskTypes.optimizer,
-    reuse_last_task_id=False
+    reuse_last_task_id=False,
 )
 
-# Connect parameters
-args = {
-    'base_train_task_id': '8b3f72f435704677abe4e27323d3eba3',  # Will be set from pipeline
-    'num_trials': 3,  # Reduced from 10 to 3 trials
-    'time_limit_minutes': 20,  # Reduced from 60 to 5 minutes
-    'run_as_service': False,
-    'test_queue': 'hpo_demo',  # Queue for test tasks
-    'processed_dataset_id': '99e286d358754697a37ad75c279a6f0a',  # Will be set from pipeline
-    'num_epochs': 20,  # Reduced from 50 to 20 epochs
-    'batch_size': 32,  # Default batch size
-    'learning_rate': 1e-3,  # Default learning rate
-    'weight_decay': 1e-5  # Default weight decay
-}
-args = task.connect(args)
-logger.info(f"Connected parameters: {args}")
+# IMPORTANT:
+# We want to run locally and log results to ClearML remote.
+# Do NOT use task.execute_remotely().
+# task.execute_remotely()
 
-# Execute the task remotely
-task.execute_remotely()
 
-# Get the dataset ID from pipeline parameters
-dataset_id = task.get_parameter('General/processed_dataset_id')  # Get from General namespace
-if not dataset_id:
-    # Try getting from args as fallback
-    dataset_id = args.get('processed_dataset_id')
-    logger.info(f"No dataset_id in General namespace, using from args: {dataset_id}")
+# ============================================================
+# Get base training task
+# ============================================================
+# You must run hpo_s3_train_model.py once before running this file.
+# This task will be cloned by ClearML HPO.
 
-if not dataset_id:
-    # Use fixed dataset ID as last resort
-    dataset_id = "99e286d358754697a37ad75c279a6f0a"
-    logger.info(f"Using fixed dataset ID: {dataset_id}")
-
-logger.info(f"Using dataset ID: {dataset_id}")
-
-# Get the actual training model task
-try:
-    BASE_TRAIN_TASK_ID = args['base_train_task_id']
-    logger.info(f"Using base training task ID: {BASE_TRAIN_TASK_ID}")
-except Exception as e:
-    logger.error(f"Failed to get base training task ID: {e}")
-    raise
-
-# Verify dataset exists
-try:
-    dataset = Dataset.get(dataset_id=dataset_id)
-    logger.info(f"Successfully verified dataset: {dataset.name}")
-except Exception as e:
-    logger.error(f"Failed to verify dataset: {e}")
-    raise
-
-# Create the HPO task
-hpo_task = HyperParameterOptimizer(
-    base_task_id=BASE_TRAIN_TASK_ID,
-    hyper_parameters=[
-        UniformIntegerParameterRange('num_epochs', min_value=10, max_value=args['num_epochs']),
-        UniformIntegerParameterRange('batch_size', min_value=16, max_value=64),  # Reduced range
-        UniformParameterRange('learning_rate', min_value=1e-4, max_value=1e-2),  # Reduced range
-        UniformParameterRange('weight_decay', min_value=1e-6, max_value=1e-4)  # Reduced range
-    ],
-    objective_metric_title='validation',
-    objective_metric_series='accuracy',
-    objective_metric_sign='max',
-    max_number_of_concurrent_tasks=2,
-    optimization_time_limit=args['time_limit_minutes'] * 60,
-    compute_time_limit=None,
-    total_max_jobs=args['num_trials'],
-    min_iteration_per_job=1,
-    max_iteration_per_job=args['num_epochs'],
-    pool_period_min=1.0,  # Reduced from 2.0 to 1.0 to check more frequently
-    execution_queue=args['test_queue'],
-    save_top_k_tasks_only=2,  # Reduced from 5 to 2
-    parameter_override={
-        'processed_dataset_id': dataset_id,
-        'General/processed_dataset_id': dataset_id,
-        'test_queue': args['test_queue'],
-        'General/test_queue': args['test_queue'],
-        'num_epochs': args['num_epochs'],
-        'General/num_epochs': args['num_epochs'],
-        'batch_size': args['batch_size'],
-        'General/batch_size': args['batch_size'],
-        'learning_rate': args['learning_rate'],
-        'General/learning_rate': args['learning_rate'],
-        'weight_decay': args['weight_decay'],
-        'General/weight_decay': args['weight_decay']
-    }
+base_task = Task.get_task(
+    project_name="AI_Studio_HPO_Demo",
+    task_name="HPO step 3 train model",
 )
 
-# Start the HPO task
-logger.info("Starting HPO task...")
-hpo_task.start()
+if base_task is None:
+    raise ValueError(
+        "Could not find base task: 'HPO step 3 train model'. "
+        "Please run `python hpo_s3_train_model.py` once before running task_hpo.py."
+    )
 
-# Wait for optimization to complete
-logger.info(f"Waiting for optimization to complete (time limit: {args['time_limit_minutes']} minutes)...")
-time.sleep(args['time_limit_minutes'] * 60)  # Wait for the full time limit
+logger.info(f"Base task ID: {base_task.id}")
 
-# Get the top performing experiments
-try:
-    top_exp = hpo_task.get_top_experiments(top_k=1)  # Get only the best experiment
-    if top_exp:
-        best_exp = top_exp[0]
-        logger.info(f"Best experiment: {best_exp.id}")
-        
-        # Get the best parameters and accuracy
-        best_params = best_exp.get_parameters()
-        metrics = best_exp.get_last_scalar_metrics()
-        best_accuracy = metrics['validation']['accuracy'] if metrics and 'validation' in metrics and 'accuracy' in metrics['validation'] else None
-        
-        # Log detailed information about the best experiment
-        logger.info("Best experiment parameters:")
-        logger.info(f"  - num_epochs: {best_params.get('num_epochs')}")
-        logger.info(f"  - batch_size: {best_params.get('batch_size')}")
-        logger.info(f"  - learning_rate: {best_params.get('learning_rate')}")
-        logger.info(f"  - weight_decay: {best_params.get('weight_decay')}")
-        logger.info(f"Best validation accuracy: {best_accuracy}")
-        
-        # Save best parameters and accuracy
-        best_results = {
-            'parameters': best_params,
-            'accuracy': best_accuracy
-        }
-        
-        # Save to a temporary file
-        temp_file = 'best_parameters.json'
-        with open(temp_file, 'w') as f:
-            json.dump(best_results, f, indent=4)
-        
-        # Upload as artifact
-        task.upload_artifact('best_parameters', temp_file)
-        logger.info(f"Saved best parameters with accuracy: {best_accuracy}")
-        
-        # Also save as task parameters for easier access
-        task.set_parameter('best_parameters', best_params)
-        task.set_parameter('best_accuracy', best_accuracy)
-        
-        logger.info("Best parameters saved as both artifact and task parameters")
-    else:
-        logger.warning("No experiments completed yet. This might be normal if the optimization just started.")
-except Exception as e:
-    logger.error(f"Failed to get top experiments: {e}")
-    raise
 
-# Make sure background optimization stopped
-hpo_task.stop()
-logger.info("Optimizer stopped")
+# ============================================================
+# Hyperparameter search space
+# ============================================================
+# model_name controls model selection.
+#
+# linear:
+#   uses model_name only
+#
+# xgboost:
+#   uses xgb_n_estimators, xgb_max_depth, xgb_learning_rate
+#
+# random_forest:
+#   uses rf_n_estimators, rf_max_depth
+#
+# lstm / gru:
+#   uses hidden_size, num_layers, dropout,
+#        learning_rate, batch_size, num_epochs, weight_decay
+#
+# transformer:
+#   uses d_model, nhead, num_encoder_layers,
+#        dim_feedforward, dropout, learning_rate, batch_size
 
-print('We are done, good bye')
+hyper_parameters = [
+    # --------------------------------------------------------
+    # Model selection
+    # --------------------------------------------------------
+    DiscreteParameterRange(
+        "General/model_name",
+        values=[
+            "linear",
+            "xgboost",
+            "random_forest",
+            "lstm",
+            "gru",
+            "transformer",
+        ],
+    ),
+
+    # --------------------------------------------------------
+    # Common deep learning training parameters
+    # --------------------------------------------------------
+    # Keep small for local CPU testing.
+    DiscreteParameterRange(
+        "General/num_epochs",
+        values=[5, 10],
+    ),
+
+    DiscreteParameterRange(
+        "General/batch_size",
+        values=[32, 64],
+    ),
+
+    # Do NOT use LogUniformParameterRange here.
+    # It produced unstable values such as learning_rate=1.0 before.
+    DiscreteParameterRange(
+        "General/learning_rate",
+        values=[1e-4, 5e-4, 1e-3, 2e-3],
+    ),
+
+    DiscreteParameterRange(
+        "General/weight_decay",
+        values=[0.0, 1e-6, 1e-5, 1e-4],
+    ),
+
+    # --------------------------------------------------------
+    # LSTM / GRU parameters
+    # --------------------------------------------------------
+    DiscreteParameterRange(
+        "General/hidden_size",
+        values=[32, 64, 128],
+    ),
+
+    DiscreteParameterRange(
+        "General/num_layers",
+        values=[1, 2],
+    ),
+
+    UniformParameterRange(
+        "General/dropout",
+        min_value=0.0,
+        max_value=0.3,
+        step_size=0.1,
+    ),
+
+    # --------------------------------------------------------
+    # Transformer parameters
+    # --------------------------------------------------------
+    DiscreteParameterRange(
+        "General/d_model",
+        values=[32, 64, 128],
+    ),
+
+    DiscreteParameterRange(
+        "General/nhead",
+        values=[2, 4],
+    ),
+
+    DiscreteParameterRange(
+        "General/num_encoder_layers",
+        values=[1, 2],
+    ),
+
+    DiscreteParameterRange(
+        "General/dim_feedforward",
+        values=[64, 128, 256],
+    ),
+
+    # --------------------------------------------------------
+    # XGBoost parameters
+    # --------------------------------------------------------
+    DiscreteParameterRange(
+        "General/xgb_n_estimators",
+        values=[100, 200, 300],
+    ),
+
+    DiscreteParameterRange(
+        "General/xgb_max_depth",
+        values=[3, 5, 7],
+    ),
+
+    DiscreteParameterRange(
+        "General/xgb_learning_rate",
+        values=[0.01, 0.03, 0.05, 0.1],
+    ),
+
+    # --------------------------------------------------------
+    # Random Forest parameters
+    # --------------------------------------------------------
+    DiscreteParameterRange(
+        "General/rf_n_estimators",
+        values=[100, 200, 300],
+    ),
+
+    DiscreteParameterRange(
+        "General/rf_max_depth",
+        values=[5, 10, 20],
+    ),
+]
+
+
+# ============================================================
+# Hyperparameter optimizer
+# ============================================================
+
+optimizer = HyperParameterOptimizer(
+    base_task_id=base_task.id,
+    hyper_parameters=hyper_parameters,
+
+    # hpo_s3_train_model.py must report:
+    # title="validation", series="RMSE"
+    objective_metric_title="validation",
+    objective_metric_series="RMSE",
+    objective_metric_sign="min",
+
+    optimizer_class=RandomSearch,
+
+    # IMPORTANT:
+    # This queue is not used when we call start_locally().
+    # It is kept here only for compatibility.
+    execution_queue="default",
+
+    # Local demo setting
+    max_number_of_concurrent_tasks=1,
+    total_max_jobs=4,
+
+    # Stop each trial if it runs too long
+    time_limit_per_job=60.0 * 60.0,
+
+    # Overall HPO budget
+    compute_time_limit=60.0 * 60.0 * 4.0,
+)
+
+
+# ============================================================
+# Start HPO locally
+# ============================================================
+# IMPORTANT:
+# Use start_locally() instead of start().
+#
+# optimizer.start() submits HPO trials to a ClearML queue.
+# optimizer.start_locally() runs HPO trials on your local machine
+# while still logging everything to ClearML remote.
+
+optimizer.start_locally()
+optimizer.wait()
+optimizer.stop()
+
+
+# ============================================================
+# Get top experiments
+# ============================================================
+
+top_experiments = optimizer.get_top_experiments(top_k=3)
+
+print("Top HPO experiments:")
+
+for i, experiment in enumerate(top_experiments, start=1):
+    print(f"Rank {i}:")
+    print(f"Task ID: {experiment.id}")
+    print(f"Task name: {experiment.name}")
+
+    try:
+        params = experiment.get_parameters()
+        print("Selected model:", params.get("General/model_name"))
+    except Exception as e:
+        print(f"Could not read parameters: {e}")
+
+
+# Store best task ID for final_model.py
+if len(top_experiments) > 0:
+    best_task = top_experiments[0]
+    task.set_parameter("General/best_task_id", best_task.id)
+    print(f"Best HPO task ID: {best_task.id}")
+else:
+    raise RuntimeError("No HPO experiments completed successfully.")
+
+
+print("HPO completed successfully.")

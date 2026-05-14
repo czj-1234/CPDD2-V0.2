@@ -1,234 +1,648 @@
+# "final_model.py"
+
 import os
-os.environ.pop('MPLBACKEND', None)
+os.environ.pop("MPLBACKEND", None)
+
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from clearml import Task, Logger, Dataset
+
+from clearml import Task
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-from tqdm import tqdm
-import time
-import os
-import pandas as pd
-import logging
-import shutil
-import json
-import numpy as np
-import seaborn as sns
 
-# Set up logging
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+import xgboost as xgb
+import numpy as np
+import pickle
+import logging
+from tqdm import tqdm
+
+
+# ============================================================
+# Logging and folders
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create necessary directories
-os.makedirs('assets', exist_ok=True)
-os.makedirs('figs', exist_ok=True)
+os.makedirs("assets", exist_ok=True)
+os.makedirs("figs", exist_ok=True)
 
-# Initialize the task
+
+# ============================================================
+# ClearML task
+# ============================================================
+
 task = Task.init(
-    project_name='AI_Studio_HPO_Demo',
-    task_name='Final Model Training',
+    project_name="AI_Studio_HPO_Demo",
+    task_name="HPO step 5 final model",
     task_type=Task.TaskTypes.training,
-    reuse_last_task_id=False
+    reuse_last_task_id=False,
 )
 
-# Connect parameters
 args = {
-    'processed_dataset_id': '99e286d358754697a37ad75c279a6f0a',  # Will be set from pipeline
-    'hpo_task_id': None,  # Will be set from pipeline
-    'test_queue': 'hpo_demo',  # Queue for test tasks
-    'num_epochs': 50,  # Will be overridden by best HPO parameters
-    'batch_size': 32,  # Will be overridden by best HPO parameters
-    'learning_rate': 1e-3,  # Will be overridden by best HPO parameters
-    'weight_decay': 1e-5  # Will be overridden by best HPO parameters
+    "best_task_id": "",
+    "processed_task_id": "",
+
+    # If no best_task_id is provided, these default values will be used
+    "model_name": "lstm",
+    "num_epochs": 30,
+    "batch_size": 32,
+    "learning_rate": 1e-3,
+    "weight_decay": 1e-5,
+
+    "hidden_size": 64,
+    "num_layers": 1,
+    "dropout": 0.1,
+
+    "d_model": 64,
+    "nhead": 4,
+    "num_encoder_layers": 2,
+    "dim_feedforward": 128,
+
+    "xgb_n_estimators": 200,
+    "xgb_max_depth": 5,
+    "xgb_learning_rate": 0.05,
+
+    "rf_n_estimators": 200,
+    "rf_max_depth": 10,
 }
+
 args = task.connect(args)
 logger.info(f"Connected parameters: {args}")
 
-# Execute the task remotely
-task.execute_remotely()
+#task.execute_remotely()
 
-# Get the dataset ID from pipeline parameters
-dataset_id = task.get_parameter('General/processed_dataset_id')  # Get from General namespace
-if not dataset_id:
-    # Try getting from args as fallback
-    dataset_id = args.get('processed_dataset_id')
-    print(f"No dataset_id now get dataset ID from args: {dataset_id}")
 
-if not dataset_id:
-    # Use fixed dataset ID as last resort
-    dataset_id = "99e286d358754697a37ad75c279a6f0a"
-    print(f"Using fixed dataset ID: {dataset_id}")
+# ============================================================
+# Helper functions
+# ============================================================
 
-logger.info(f"Received dataset ID from parameters: {dataset_id}")
+def load_pickle_from_artifact(source_task, artifact_name):
+    artifact_path = source_task.artifacts[artifact_name].get_local_copy()
+    with open(artifact_path, "rb") as f:
+        return pickle.load(f)
 
-if not dataset_id:
-    logger.error("Processed dataset ID not found in parameters. Please ensure it's passed from the pipeline.")
-    raise ValueError("Processed dataset ID not found in parameters. Please ensure it's passed from the pipeline.")
 
-# Get the HPO task ID
-hpo_task_id = args.get('hpo_task_id')
-if not hpo_task_id:
-    logger.error("HPO task ID not found in parameters")
-    raise ValueError("HPO task ID not found in parameters")
+def flatten_sequences(X):
+    return X.reshape(X.shape[0], -1)
 
-# Get the HPO task
-hpo_task = Task.get_task(task_id=hpo_task_id)
-logger.info(f"Retrieved HPO task: {hpo_task.name}")
 
-# Get best parameters
-try:
-    # First try to get from task parameters
-    best_params = hpo_task.get_parameter('best_parameters')
-    best_accuracy = hpo_task.get_parameter('best_accuracy')
-    
-    if best_params is None:
-        # If not in parameters, try to get from artifact
-        logger.info("Best parameters not found in task parameters, trying artifact...")
-        if 'best_parameters' not in hpo_task.artifacts:
-            logger.error("No best_parameters artifact found in HPO task")
-            raise ValueError("No best_parameters artifact found in HPO task")
-            
-        artifact_path = hpo_task.artifacts['best_parameters'].get_local_copy()
-        if artifact_path is None:
-            logger.error("Failed to get local copy of best_parameters artifact")
-            raise ValueError("Failed to get local copy of best_parameters artifact")
-            
-        logger.info(f"Downloaded best parameters from: {artifact_path}")
-        
-        with open(artifact_path, 'r') as f:
-            best_results = json.load(f)
-        
-        best_params = best_results['parameters']
-        best_accuracy = best_results.get('accuracy')
-    
-    # Update training parameters with best values
-    args['num_epochs'] = best_params.get('num_epochs', args['num_epochs'])
-    args['batch_size'] = best_params.get('batch_size', args['batch_size'])
-    args['learning_rate'] = best_params.get('learning_rate', args['learning_rate'])
-    args['weight_decay'] = best_params.get('weight_decay', args['weight_decay'])
-    
-    logger.info(f"Using best parameters from HPO: {best_params}")
-    logger.info(f"Best validation accuracy from HPO: {best_accuracy}")
-except Exception as e:
-    logger.error(f"Failed to get best parameters from HPO task: {e}")
-    raise
+def inverse_transform_target(y_scaled, scaler, target_index, num_features):
+    y_scaled = np.asarray(y_scaled).reshape(-1)
 
-# Verify dataset exists
-try:
-    dataset = Dataset.get(dataset_id=dataset_id)
-    logger.info(f"Successfully verified dataset: {dataset.name}")
-except Exception as e:
-    logger.error(f"Failed to verify dataset: {e}")
-    raise
+    dummy = np.zeros((len(y_scaled), num_features))
+    dummy[:, target_index] = y_scaled
 
-# Load the data
-try:
-    # Get the dataset path
-    dataset_path = dataset.get_local_copy()
-    logger.info(f"Dataset downloaded to: {dataset_path}")
-    
-    # Load training and testing data from separate files
-    X_train = pd.read_csv(os.path.join(dataset_path, 'X_train.csv')).values
-    X_test = pd.read_csv(os.path.join(dataset_path, 'X_test.csv')).values
-    y_train = pd.read_csv(os.path.join(dataset_path, 'y_train.csv')).values.ravel()
-    y_test = pd.read_csv(os.path.join(dataset_path, 'y_test.csv')).values.ravel()
+    inversed = scaler.inverse_transform(dummy)
+    return inversed[:, target_index]
 
-    # Convert to PyTorch tensors
-    X_train = torch.FloatTensor(X_train)
-    y_train = torch.LongTensor(y_train)
-    X_test = torch.FloatTensor(X_test)
-    y_test = torch.LongTensor(y_test)
 
-    # Create data loaders
-    train_dataset = TensorDataset(X_train, y_train)
-    test_dataset = TensorDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=args['batch_size'], shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=args['batch_size'], shuffle=False)
-    
-    logger.info(f"Data loaded successfully. Training samples: {len(X_train)}, Testing samples: {len(X_test)}")
-except Exception as e:
-    logger.error(f"Failed to load data: {e}")
-    raise
+def calculate_metrics(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
 
-# Define the model
-class SimpleNN(nn.Module):
-    def __init__(self, input_size):
-        super(SimpleNN, self).__init__()
-        self.layer1 = nn.Linear(input_size, 128)
-        self.layer2 = nn.Linear(128, 64)
-        self.layer3 = nn.Linear(64, len(set(y_train.numpy())))  # In case labels change
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.3)
-        
+    mape = np.mean(
+        np.abs((y_true - y_pred) / np.clip(np.abs(y_true), 1e-8, None))
+    ) * 100
+
+    r2 = r2_score(y_true, y_pred)
+
+    return {
+        "MSE": float(mse),
+        "RMSE": float(rmse),
+        "MAE": float(mae),
+        "MAPE": float(mape),
+        "R2": float(r2),
+    }
+
+
+def plot_prediction(y_true, y_pred, save_path, title):
+    plt.figure(figsize=(12, 5))
+    plt.plot(y_true[:300], label="Actual")
+    plt.plot(y_pred[:300], label="Predicted")
+    plt.title(title)
+    plt.xlabel("Time Step")
+    plt.ylabel("Power Load")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+
+# ============================================================
+# PyTorch models
+# ============================================================
+
+class LSTMForecaster(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=1, dropout=0.1):
+        super(LSTMForecaster, self).__init__()
+
+        lstm_dropout = dropout if num_layers > 1 else 0.0
+
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=lstm_dropout,
+        )
+
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
+
     def forward(self, x):
-        x = self.relu(self.layer1(x))
-        x = self.dropout(x)
-        x = self.relu(self.layer2(x))
-        x = self.dropout(x)
-        x = self.layer3(x)
-        return x
+        output, _ = self.lstm(x)
+        last_output = output[:, -1, :]
+        prediction = self.fc(last_output)
+        return prediction.squeeze(-1)
 
-# Initialize model, loss function, and optimizer
-model = SimpleNN(X_train.shape[1])
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=args['learning_rate'], weight_decay=args['weight_decay'])
 
-# Training loop
-logger.info("Starting training...")
-for epoch in range(args['num_epochs']):
-    model.train()
-    running_loss = 0.0
-    
-    for inputs, labels in train_loader:
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        running_loss += loss.item()
-    
-    # Report training loss
-    avg_loss = running_loss / len(train_loader)
-    task.get_logger().report_scalar('training', 'loss', value=avg_loss, iteration=epoch)
-    logger.info(f'Epoch {epoch+1}/{args["num_epochs"]}, Loss: {avg_loss:.4f}')
-    
-    # Validation
+class GRUForecaster(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=1, dropout=0.1):
+        super(GRUForecaster, self).__init__()
+
+        gru_dropout = dropout if num_layers > 1 else 0.0
+
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=gru_dropout,
+        )
+
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, x):
+        output, _ = self.gru(x)
+        last_output = output[:, -1, :]
+        prediction = self.fc(last_output)
+        return prediction.squeeze(-1)
+
+
+class TransformerForecaster(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        d_model=64,
+        nhead=4,
+        num_encoder_layers=2,
+        dim_feedforward=128,
+        dropout=0.1,
+    ):
+        super(TransformerForecaster, self).__init__()
+
+        self.input_projection = nn.Linear(input_size, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_encoder_layers,
+        )
+
+        self.fc = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(self, x):
+        x = self.input_projection(x)
+        encoded = self.transformer_encoder(x)
+        last_output = encoded[:, -1, :]
+        prediction = self.fc(last_output)
+        return prediction.squeeze(-1)
+
+
+# ============================================================
+# Training functions
+# ============================================================
+
+def train_torch_model(
+    model,
+    train_loader,
+    val_loader,
+    num_epochs,
+    learning_rate,
+    weight_decay,
+    device,
+):
+    criterion = nn.MSELoss()
+
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+
+    model.to(device)
+
+    best_val_rmse = float("inf")
+    best_state = None
+
+    for epoch in tqdm(range(num_epochs), desc="Final Model Training"):
+        model.train()
+        train_losses = []
+
+        for batch_X, batch_y in train_loader:
+            batch_X = batch_X.to(device)
+            batch_y = batch_y.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+
+            train_losses.append(loss.item())
+
+        avg_train_loss = float(np.mean(train_losses))
+
+        model.eval()
+        val_preds = []
+        val_targets = []
+
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                batch_X = batch_X.to(device)
+                outputs = model(batch_X)
+
+                val_preds.extend(outputs.cpu().numpy())
+                val_targets.extend(batch_y.numpy())
+
+        val_preds = np.array(val_preds)
+        val_targets = np.array(val_targets)
+
+        val_rmse_scaled = float(np.sqrt(mean_squared_error(val_targets, val_preds)))
+
+        task.get_logger().report_scalar(
+            title="final_train",
+            series="loss",
+            value=avg_train_loss,
+            iteration=epoch,
+        )
+
+        task.get_logger().report_scalar(
+            title="final_validation",
+            series="RMSE",
+            value=val_rmse_scaled,
+            iteration=epoch,
+        )
+
+        if val_rmse_scaled < best_val_rmse:
+            best_val_rmse = val_rmse_scaled
+            best_state = model.state_dict()
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model
+
+
+def predict_torch_model(model, loader, device):
     model.eval()
-    correct = 0
-    total = 0
-    all_preds = []
-    all_labels = []
-    
+    preds = []
+    targets = []
+
     with torch.no_grad():
-        for inputs, labels in test_loader:
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            all_preds.extend(predicted.numpy())
-            all_labels.extend(labels.numpy())
-    
-    accuracy = 100 * correct / total
-    task.get_logger().report_scalar('validation', 'accuracy', value=accuracy, iteration=epoch)
-    logger.info(f'Validation Accuracy: {accuracy:.2f}%')
+        for batch_X, batch_y in loader:
+            batch_X = batch_X.to(device)
+            outputs = model(batch_X)
 
-# Plot confusion matrix
-cm = confusion_matrix(all_labels, all_preds)
-plt.figure(figsize=(8, 6))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-plt.title('Confusion Matrix')
-plt.ylabel('True Label')
-plt.xlabel('Predicted Label')
-task.get_logger().report_matplotlib_figure('Confusion Matrix', 'confusion_matrix', plt.gcf(), epoch)
+            preds.extend(outputs.cpu().numpy())
+            targets.extend(batch_y.numpy())
 
-# Save the final model
-torch.save(model.state_dict(), 'final_model.pth')
-task.upload_artifact('model', 'final_model.pth')
-logger.info("Model saved and uploaded as artifact")
+    return np.array(targets), np.array(preds)
 
-print('Training completed successfully!') 
+
+# ============================================================
+# Get best HPO parameters
+# ============================================================
+
+best_task_id = args.get("best_task_id", "")
+
+if not best_task_id:
+    best_task_id = task.get_parameter("General/best_task_id")
+
+if best_task_id:
+    best_task = Task.get_task(task_id=best_task_id)
+    best_params = best_task.get_parameters()
+
+    logger.info(f"Using best HPO task: {best_task_id}")
+    logger.info(f"Best task name: {best_task.name}")
+
+    def get_best_param(name, default):
+        return best_params.get(f"General/{name}", default)
+
+    args["model_name"] = get_best_param("model_name", args["model_name"])
+    args["num_epochs"] = int(float(get_best_param("num_epochs", args["num_epochs"])))
+    args["batch_size"] = int(float(get_best_param("batch_size", args["batch_size"])))
+    args["learning_rate"] = float(get_best_param("learning_rate", args["learning_rate"]))
+    args["weight_decay"] = float(get_best_param("weight_decay", args["weight_decay"]))
+
+    args["hidden_size"] = int(float(get_best_param("hidden_size", args["hidden_size"])))
+    args["num_layers"] = int(float(get_best_param("num_layers", args["num_layers"])))
+    args["dropout"] = float(get_best_param("dropout", args["dropout"]))
+
+    args["d_model"] = int(float(get_best_param("d_model", args["d_model"])))
+    args["nhead"] = int(float(get_best_param("nhead", args["nhead"])))
+    args["num_encoder_layers"] = int(float(get_best_param("num_encoder_layers", args["num_encoder_layers"])))
+    args["dim_feedforward"] = int(float(get_best_param("dim_feedforward", args["dim_feedforward"])))
+
+    args["xgb_n_estimators"] = int(float(get_best_param("xgb_n_estimators", args["xgb_n_estimators"])))
+    args["xgb_max_depth"] = int(float(get_best_param("xgb_max_depth", args["xgb_max_depth"])))
+    args["xgb_learning_rate"] = float(get_best_param("xgb_learning_rate", args["xgb_learning_rate"]))
+
+    args["rf_n_estimators"] = int(float(get_best_param("rf_n_estimators", args["rf_n_estimators"])))
+    args["rf_max_depth"] = int(float(get_best_param("rf_max_depth", args["rf_max_depth"])))
+
+else:
+    logger.warning("No best_task_id found. Using default connected parameters.")
+
+
+# ============================================================
+# Load processed artifacts from Step 2
+# ============================================================
+
+processed_task_id = args.get("processed_task_id", "")
+
+if not processed_task_id:
+    processed_task_id = task.get_parameter("General/processed_task_id")
+
+if not processed_task_id:
+    logger.warning(
+        "No processed_task_id found. Trying to find task by project and task name."
+    )
+    processed_task = Task.get_task(
+        project_name="AI_Studio_HPO_Demo",
+        task_name="HPO step 2 process dataset",
+    )
+else:
+    processed_task = Task.get_task(task_id=processed_task_id)
+
+logger.info(f"Using processed task ID: {processed_task.id}")
+
+X_train = load_pickle_from_artifact(processed_task, "X_train")
+y_train = load_pickle_from_artifact(processed_task, "y_train")
+X_val = load_pickle_from_artifact(processed_task, "X_val")
+y_val = load_pickle_from_artifact(processed_task, "y_val")
+X_test = load_pickle_from_artifact(processed_task, "X_test")
+y_test = load_pickle_from_artifact(processed_task, "y_test")
+scaler = load_pickle_from_artifact(processed_task, "scaler")
+feature_cols = load_pickle_from_artifact(processed_task, "feature_cols")
+metadata = load_pickle_from_artifact(processed_task, "metadata")
+
+target_index = metadata["target_index"]
+target_region = metadata["target_region"]
+num_features = len(feature_cols)
+
+logger.info(f"X_train shape: {X_train.shape}")
+logger.info(f"X_val shape: {X_val.shape}")
+logger.info(f"X_test shape: {X_test.shape}")
+logger.info(f"Target region: {target_region}")
+logger.info(f"Best model name: {args['model_name']}")
+
+
+# ============================================================
+# Train final model
+# ============================================================
+
+model_name = args["model_name"].lower()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+logger.info(f"Training final model: {model_name}")
+logger.info(f"Using device: {device}")
+
+if model_name in ["linear", "xgboost", "random_forest"]:
+    X_train_full = np.concatenate([X_train, X_val], axis=0)
+    y_train_full = np.concatenate([y_train, y_val], axis=0)
+
+    X_train_full_flat = flatten_sequences(X_train_full)
+    X_test_flat = flatten_sequences(X_test)
+
+    if model_name == "linear":
+        model = LinearRegression()
+        model.fit(X_train_full_flat, y_train_full)
+
+    elif model_name == "xgboost":
+        model = xgb.XGBRegressor(
+            n_estimators=int(args["xgb_n_estimators"]),
+            max_depth=int(args["xgb_max_depth"]),
+            learning_rate=float(args["xgb_learning_rate"]),
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+        )
+        model.fit(X_train_full_flat, y_train_full, verbose=False)
+
+    elif model_name == "random_forest":
+        model = RandomForestRegressor(
+            n_estimators=int(args["rf_n_estimators"]),
+            max_depth=int(args["rf_max_depth"]),
+            random_state=42,
+            n_jobs=-1,
+        )
+        model.fit(X_train_full_flat, y_train_full)
+
+    test_pred_scaled = model.predict(X_test_flat)
+
+    model_path = "final_model.pkl"
+    with open(model_path, "wb") as f:
+        pickle.dump(model, f)
+
+else:
+    X_train_full = np.concatenate([X_train, X_val], axis=0)
+    y_train_full = np.concatenate([y_train, y_val], axis=0)
+
+    train_dataset = TensorDataset(
+        torch.FloatTensor(X_train_full),
+        torch.FloatTensor(y_train_full),
+    )
+    val_dataset = TensorDataset(
+        torch.FloatTensor(X_val),
+        torch.FloatTensor(y_val),
+    )
+    test_dataset = TensorDataset(
+        torch.FloatTensor(X_test),
+        torch.FloatTensor(y_test),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=int(args["batch_size"]),
+        shuffle=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=int(args["batch_size"]),
+        shuffle=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=int(args["batch_size"]),
+        shuffle=False,
+    )
+
+    input_size = X_train.shape[2]
+
+    if model_name == "lstm":
+        model = LSTMForecaster(
+            input_size=input_size,
+            hidden_size=int(args["hidden_size"]),
+            num_layers=int(args["num_layers"]),
+            dropout=float(args["dropout"]),
+        )
+
+    elif model_name == "gru":
+        model = GRUForecaster(
+            input_size=input_size,
+            hidden_size=int(args["hidden_size"]),
+            num_layers=int(args["num_layers"]),
+            dropout=float(args["dropout"]),
+        )
+
+    elif model_name == "transformer":
+        model = TransformerForecaster(
+            input_size=input_size,
+            d_model=int(args["d_model"]),
+            nhead=int(args["nhead"]),
+            num_encoder_layers=int(args["num_encoder_layers"]),
+            dim_feedforward=int(args["dim_feedforward"]),
+            dropout=float(args["dropout"]),
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported model_name: {model_name}. "
+            "Please choose from linear, xgboost, random_forest, lstm, gru, transformer."
+        )
+
+    model = train_torch_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=int(args["num_epochs"]),
+        learning_rate=float(args["learning_rate"]),
+        weight_decay=float(args["weight_decay"]),
+        device=device,
+    )
+
+    _, test_pred_scaled = predict_torch_model(model, test_loader, device)
+
+    model_path = "final_model.pth"
+    torch.save(
+        {
+            "model_name": model_name,
+            "model_state_dict": model.state_dict(),
+            "args": dict(args),
+            "input_size": input_size,
+        },
+        model_path,
+    )
+
+
+# ============================================================
+# Evaluate on original scale
+# ============================================================
+
+y_test_original = inverse_transform_target(
+    y_test,
+    scaler,
+    target_index,
+    num_features,
+)
+
+test_pred_original = inverse_transform_target(
+    test_pred_scaled,
+    scaler,
+    target_index,
+    num_features,
+)
+
+test_metrics = calculate_metrics(y_test_original, test_pred_original)
+
+logger.info(f"Final test metrics: {test_metrics}")
+
+
+# ============================================================
+# Report metrics
+# ============================================================
+
+for metric_name, metric_value in test_metrics.items():
+    task.get_logger().report_scalar(
+        title="Final Test",
+        series=metric_name,
+        value=metric_value,
+        iteration=0,
+    )
+
+task.set_parameter("General/final_model_name", model_name)
+task.set_parameter("General/final_test_RMSE", test_metrics["RMSE"])
+task.set_parameter("General/final_test_MAE", test_metrics["MAE"])
+task.set_parameter("General/final_test_MAPE", test_metrics["MAPE"])
+task.set_parameter("General/final_test_R2", test_metrics["R2"])
+
+
+# ============================================================
+# Save artifacts
+# ============================================================
+
+task.upload_artifact("final_model", model_path)
+
+metrics_path = "final_metrics.pkl"
+with open(metrics_path, "wb") as f:
+    pickle.dump(
+        {
+            "model_name": model_name,
+            "test_metrics": test_metrics,
+            "args": dict(args),
+        },
+        f,
+    )
+
+task.upload_artifact("final_metrics", metrics_path)
+
+prediction_path = "figs/final_prediction_plot.png"
+plot_prediction(
+    y_true=y_test_original,
+    y_pred=test_pred_original,
+    save_path=prediction_path,
+    title=f"Final Power Load Forecasting - {model_name.upper()}",
+)
+
+task.upload_artifact("final_prediction_plot", prediction_path)
+
+print("Final model training completed successfully.")
+print(f"Final model: {model_name}")
+print(f"Final Test RMSE: {test_metrics['RMSE']:.4f}")
+print(f"Final Test MAE: {test_metrics['MAE']:.4f}")
+print(f"Final Test MAPE: {test_metrics['MAPE']:.4f}")
+print(f"Final Test R2: {test_metrics['R2']:.4f}")
